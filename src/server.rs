@@ -1,27 +1,26 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
-use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
+use crate::constants::{UDP_BUFFER_SIZE, listen_backoff};
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
-    HASH_WIDTH_IN_BYTES,
+    self, Ack, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello, UdpTraffic,
+    read_auth, read_hello,
 };
 use crate::transport::{SocketOpts, TcpTransport, Transport};
-use anyhow::{anyhow, bail, Context, Result};
-use backoff::backoff::Backoff;
+use anyhow::{Context, Result, anyhow, bail};
 use backoff::ExponentialBackoff;
-
+use backoff::backoff::Backoff;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time;
-use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
+use tracing::{Instrument, Span, debug, error, info, info_span, instrument, warn};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -45,11 +44,13 @@ pub async fn run_server(
     update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     let config = match config.server {
-            Some(config) => config,
-            None => {
-                return Err(anyhow!("Try to run as a server, but the configuration is missing. Please add the `[server]` block"))
-            }
-        };
+        Some(config) => config,
+        None => {
+            return Err(anyhow!(
+                "Try to run as a server, but the configuration is missing. Please add the `[server]` block"
+            ));
+        }
+    };
 
     match config.transport.transport_type {
         TransportType::Tcp => {
@@ -286,23 +287,25 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
     // Generate a nonce
     let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
 
     // Send hello
     let hello_send = Hello::ControlChannelHello(
         protocol::CURRENT_PROTO_VERSION,
         nonce.clone().try_into().unwrap(),
     );
-    conn.write_all(&bincode::serialize(&hello_send).unwrap())
+    conn.write_all(&bincode::encode_to_vec(&hello_send, bincode::config::standard()).unwrap())
         .await?;
-    conn.flush().await?;
 
     // Lookup the service
     let service_config = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
-                .await?;
+            conn.write_all(
+                &bincode::encode_to_vec(&Ack::ServiceNotExist, bincode::config::standard())
+                    .unwrap(),
+            )
+            .await?;
             bail!("No such a service {}", hex::encode(service_digest));
         }
     }
@@ -320,8 +323,10 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     // Validate
     let session_key = protocol::digest(&concat);
     if session_key != d {
-        conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
-            .await?;
+        conn.write_all(
+            &bincode::encode_to_vec(&Ack::AuthFailed, bincode::config::standard()).unwrap(),
+        )
+        .await?;
         debug!(
             "Expect {}, but got {}",
             hex::encode(session_key),
@@ -343,7 +348,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         }
 
         // Send ack
-        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
+        conn.write_all(&bincode::encode_to_vec(&Ack::Ok, bincode::config::standard()).unwrap())
             .await?;
         conn.flush().await?;
 
@@ -427,6 +432,7 @@ where
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
+
         match service.service_type {
             ServiceType::Tcp => tokio::spawn(
                 async move {
@@ -506,8 +512,14 @@ impl<T: Transport> ControlChannel<T> {
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
-        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
+        let create_ch_cmd = bincode::encode_to_vec(
+            &ControlChannelCmd::CreateDataChannel,
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let heartbeat =
+            bincode::encode_to_vec(&ControlChannelCmd::HeartBeat, bincode::config::standard())
+                .unwrap();
 
         // Wait for data channel requests and the shutdown signal
         loop {
@@ -630,7 +642,11 @@ async fn run_tcp_connection_pool<T: Transport>(
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+    let cmd = bincode::encode_to_vec(
+        &DataChannelCmd::StartForwardTcp,
+        bincode::config::standard(),
+    )
+    .unwrap();
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
@@ -663,7 +679,15 @@ async fn run_udp_connection_pool<T: Transport>(
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    // TODO: Load balance
+    // Hash-based UDP load balancing
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn hash_addr(addr: &std::net::SocketAddr) -> usize {
+        let mut hasher = DefaultHasher::new();
+        addr.hash(&mut hasher);
+        hasher.finish() as usize
+    }
 
     let l = retry_notify_with_deadline(
         listen_backoff(),
@@ -678,14 +702,23 @@ async fn run_udp_connection_pool<T: Transport>(
 
     info!("Listening at {}", &bind_addr);
 
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
+    let cmd = bincode::encode_to_vec(
+        &DataChannelCmd::StartForwardUdp,
+        bincode::config::standard(),
+    )
+    .unwrap();
 
-    // Receive one data channel
-    let mut conn = data_ch_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("No available data channels"))?;
-    write_and_flush(&mut conn, &cmd).await?;
+    // Receive multiple data channels
+    let mut conns = Vec::with_capacity(UDP_POOL_SIZE);
+    for _ in 0..UDP_POOL_SIZE {
+        if let Some(mut conn) = data_ch_rx.recv().await {
+            write_and_flush(&mut conn, &cmd).await?;
+            conns.push(conn);
+        }
+    }
+    if conns.is_empty() {
+        return Err(anyhow!("No available data channels"));
+    }
 
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
@@ -693,14 +726,17 @@ async fn run_udp_connection_pool<T: Transport>(
             // Forward inbound traffic to the client
             val = l.recv_from(&mut buf) => {
                 let (n, from) = val?;
-                UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
+                let data_to_send: Vec<u8> = buf[..n].to_vec();
+                let idx = hash_addr(&from) % conns.len();
+                let conn = &mut conns[idx];
+                UdpTraffic::write_slice(conn, from, &data_to_send).await?;
             },
 
             // Forward outbound traffic from the client to the visitor
-            hdr_len = conn.read_u8() => {
-                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
+            hdr_len = conns[0].read_u8() => {
+                let t = UdpTraffic::read(&mut conns[0], hdr_len?).await?;
                 l.send_to(&t.data, t.from).await?;
-            }
+            },
 
             _ = shutdown_rx.recv() => {
                 break;

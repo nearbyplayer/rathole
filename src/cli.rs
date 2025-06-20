@@ -1,7 +1,7 @@
-use clap::{AppSettings, ArgGroup, Parser};
+use clap::{Parser, ValueEnum};
 use lazy_static::lazy_static;
 
-#[derive(clap::ArgEnum, Clone, Debug, Copy)]
+#[derive(ValueEnum, Clone, Debug, Copy)]
 pub enum KeypairType {
     X25519,
     X448,
@@ -11,16 +11,7 @@ lazy_static! {
     static ref VERSION: &'static str =
         option_env!("VERGEN_GIT_SEMVER_LIGHTWEIGHT").unwrap_or(env!("VERGEN_BUILD_SEMVER"));
     static ref LONG_VERSION: String = format!(
-        "
-Build Timestamp:     {}
-Build Version:       {}
-Commit SHA:          {:?}
-Commit Date:         {:?}
-Commit Branch:       {:?}
-cargo Target Triple: {}
-cargo Profile:       {}
-cargo Features:      {}
-",
+        "\nBuild Timestamp:     {}\nBuild Version:       {}\nCommit SHA:          {:?}\nCommit Date:         {:?}\nCommit Branch:       {:?}\ncargo Target Triple: {}\ncargo Profile:       {}\ncargo Features:      {}\n",
         env!("VERGEN_BUILD_TIMESTAMP"),
         env!("VERGEN_BUILD_SEMVER"),
         option_env!("VERGEN_GIT_SHA"),
@@ -33,36 +24,40 @@ cargo Features:      {}
 }
 
 #[derive(Parser, Debug, Default, Clone)]
-#[clap(
+#[command(
     about,
-    version(*VERSION),
-    long_version(LONG_VERSION.as_str()),
-    setting(AppSettings::DeriveDisplayOrder)
+    version = *VERSION,
+    long_version = LONG_VERSION.as_str(),
+    group(
+        clap::ArgGroup::new("cmds")
+            .required(true)
+            .args(["config-path", "genkey"])
+    )
 )]
-#[clap(group(
-            ArgGroup::new("cmds")
-                .required(true)
-                .args(&["CONFIG", "genkey"]),
-        ))]
 pub struct Cli {
     /// The path to the configuration file
     ///
     /// Running as a client or a server is automatically determined
     /// according to the configuration file.
-    #[clap(parse(from_os_str), name = "CONFIG")]
+    #[arg(
+        long = "config-path",
+        value_name = "CONFIG",
+        value_parser,
+        required = false
+    )]
     pub config_path: Option<std::path::PathBuf>,
 
     /// Run as a server
-    #[clap(long, short, group = "mode")]
+    #[arg(long, short, group = "mode")]
     pub server: bool,
 
     /// Run as a client
-    #[clap(long, short, group = "mode")]
+    #[arg(long, short, group = "mode")]
     pub client: bool,
 
     /// Generate a keypair for the use of the noise protocol
     ///
     /// The DH function to use is x25519
-    #[clap(long, arg_enum, value_name = "CURVE")]
+    #[arg(long, value_enum, value_name = "CURVE")]
     pub genkey: Option<Option<KeypairType>>,
 }

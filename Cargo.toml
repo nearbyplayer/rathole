@@ -1,23 +1,23 @@
 [package]
 name = "rathole"
-version = "0.5.0"
-edition = "2021"
+version = "0.5.1"
 authors = ["Yujia Qiao <code@rapiz.me>"]
-description = "A reverse proxy for NAT traversal"
-license = "Apache-2.0"
-repository = "https://github.com/rapiz1/rathole"
-readme = "README.md"
 build = "build.rs"
+edition = "2024"
 include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/rapiz1/rathole"
+description = "A reverse proxy for NAT traversal"
 
 [features]
 default = [
-    "server",
-    "client",
-    "native-tls",
-    "noise",
-    "websocket-native-tls",
-    "hot-reload",
+  "server",
+  "client",
+  "native-tls",
+  "noise",
+  "websocket-native-tls",
+  "hot-reload",
 ]
 
 # Run as a server
@@ -26,31 +26,26 @@ server = []
 client = []
 
 # TLS support
-native-tls = ["tokio-native-tls"]
-rustls = [
-    "tokio-rustls",
-    "rustls-pemfile",
-    "rustls-native-certs",
-    "p12",
-]
+native-tls = ["tokio-native-tls", "openssl"]
+rustls = ["tokio-rustls", "rustls-pemfile", "rustls-native-certs", "p12"]
 
 # Noise support
 noise = ["snowstorm", "base64"]
 
 # Websocket support
 websocket-native-tls = [
-    "tokio-tungstenite",
-    "tokio-util",
-    "futures-core",
-    "futures-sink",
-    "native-tls",
+  "tokio-tungstenite",
+  "tokio-util",
+  "futures-core",
+  "futures-sink",
+  "native-tls",
 ]
 websocket-rustls = [
-    "tokio-tungstenite",
-    "tokio-util",
-    "futures-core",
-    "futures-sink",
-    "rustls",
+  "tokio-tungstenite",
+  "tokio-util",
+  "futures-core",
+  "futures-sink",
+  "rustls",
 ]
 
 # Configuration hot-reload support
@@ -84,55 +79,42 @@ lto = true
 codegen-units = 1
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-bytes = { version = "1", features = ["serde"] }
-clap = { version = "3.0", features = ["derive"] }
-toml = "0.5"
-serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
-sha2 = "0.10"
-bincode = "1"
-lazy_static = "1.4"
-hex = "0.4"
-rand = "0.8"
-backoff = { version = "0.4", features = ["tokio"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-socket2 = { version = "0.4", features = ["all"] }
-fdlimit = "0.2"
+async-http-proxy = { version = "1.2", features = ["runtime-tokio", "basic-auth"] }
+async-socks5 = "0.6.0"
 async-trait = "0.1"
-snowstorm = { version = "0.4", optional = true, features = [
-    "stream",
-], default-features = false }
-base64 = { version = "0.13", optional = true }
-notify = { version = "5.0.0-pre.13", optional = true }
-console-subscriber = { version = "0.1", optional = true, features = [
-    "parking_lot",
-] }
 atty = "0.2"
-async-http-proxy = { version = "1.2", features = [
-    "runtime-tokio",
-    "basic-auth",
-] }
-async-socks5 = "0.5"
-url = { version = "2.2", features = ["serde"] }
-tokio-tungstenite = { version = "0.20.1", optional = true }
-tokio-util = { version = "0.7.9", optional = true, features = ["io"] }
+backoff = { version = "0.4", features = ["tokio"] }
+base64 = { version = "0.22.1", optional = true }
+bincode = "2.0.1"
+bytes = { version = "1", features = ["serde"] }
+clap = { version = "4.5.40", features = ["derive"] }
+console-subscriber = { version = "0.4.1", optional = true, features = ["parking_lot"] }
+fdlimit = "0.3.0"
 futures-core = { version = "0.3.28", optional = true }
 futures-sink = { version = "0.3.28", optional = true }
-tokio-native-tls = { version = "0.3", optional = true }
-tokio-rustls = { version = "0.25", optional = true }
-rustls-native-certs = { version = "0.7", optional = true }
-rustls-pemfile = { version = "2.0", optional = true }
-p12 = { version = "0.6.3", optional = true }
-
-[target.'cfg(target_env = "musl")'.dependencies]
+hex = "0.4"
+lazy_static = "1.4"
+notify = { version = "8.0.0", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
+p12 = { version = "0.6.3", optional = true }
+rand = "0.9.1"
+rustls-native-certs = { version = "0.8.1", optional = true }
+rustls-pemfile = { version = "2.0", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+snowstorm = { version = "0.4", optional = true, features = ["stream"], default-features = false }
+socket2 = { version = "0.5.10", features = ["all"] }
+tokio = { version = "1", features = ["full"] }
+tokio-native-tls = { version = "0.3", optional = true }
+tokio-rustls = { version = "0.26.2", optional = true }
+tokio-tungstenite = { version = "0.27.0", optional = true }
+tokio-util = { version = "0.7.9", optional = true, features = ["io"] }
+toml = "0.8.23"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2.2", features = ["serde"] }
 
 [build-dependencies]
-vergen = { version = "7.4.2", default-features = false, features = [
-    "build",
-    "git",
-    "cargo",
-] }
+vergen = { version = "7.4.2", default-features = false, features = ["build", "git", "cargo"] }
 anyhow = "1.0"

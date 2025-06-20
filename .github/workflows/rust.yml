@@ -14,19 +14,20 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  OPENSSL_NO_VENDOR: "0"
+  OPENSSL_STATIC: "1"
 
 jobs:
   lints:
     name: Lints
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy -- -D warnings
       - name: Setup cargo-hack
@@ -36,39 +37,83 @@ jobs:
           cargo hack check --feature-powerset --no-dev-deps
           --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
 
+  get_version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.package_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from Cargo.toml
+        id: package_version
+        run: |
+          version=$(grep '^version' Cargo.toml | head -n1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$version" >> $GITHUB_OUTPUT
+
   build:
     name: Build for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: [get_version]
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             exe: rathole
             target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            exe: rathole.exe
-            target: x86_64-pc-windows-msvc
-          - os: macos-latest
+          - os: ubuntu-24.04
             exe: rathole
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            exe: rathole
-            target: aarch64-apple-darwin
+            target: aarch64-unknown-linux-gnu
 
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
         with:
-          profile: minimal
           toolchain: stable
-      - uses: Swatinem/rust-cache@v1
-      - name: Build
-        run: cargo build
-      - name: Run tests with native-tls
-        run: cargo test --verbose
-      - name: Run tests with rustls
-        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
-      - uses: actions/upload-artifact@v2
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        run: cargo install cross
+      - name: Build with cross for ${{ matrix.target }}
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build --target ${{ matrix.target }} --release --features embedded --no-default-features
+      - name: Build for ${{ matrix.target }}
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --target ${{ matrix.target }} --release
+      - name: Rename binary for artifact
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.exe }} target/${{ matrix.target }}/release/rathole-${{ needs.get_version.outputs.version }}-${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
         with:
-          name: rathole-${{ matrix.target }}
-          path: target/debug/${{ matrix.exe }}
+          name: rathole-${{ needs.get_version.outputs.version }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/rathole-${{ needs.get_version.outputs.version }}-${{ matrix.target }}
+  release:
+    name: Release
+    runs-on: ubuntu-24.04
+    needs: [build, get_version]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifact files
+        run: |
+          mkdir flat
+          find artifacts -type f -exec cp {} flat/ \;
+      - name: Make binaries executable
+        run: chmod +x flat/*
+      - name: Run UPX
+        continue-on-error: true
+        uses: crazy-max/ghaction-upx@v3.2.0
+        with:
+          version: 'v5.0.0'
+          args: -q --best --lzma
+          files: flat/*
+      - name: Create release
+        uses: softprops/action-gh-release@v2.3.2
+        with:
+          tag_name: v${{ needs.get_version.outputs.version }}
+          name: v${{ needs.get_version.outputs.version }}
+          files: flat/*
+          draft: false
+          prerelease: false

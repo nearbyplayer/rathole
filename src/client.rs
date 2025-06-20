@@ -3,23 +3,23 @@ use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
-    self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
-    DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
+    self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES,
+    UdpTraffic, read_ack, read_control_cmd, read_data_cmd, read_hello,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
-use backoff::ExponentialBackoff;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::time::{self, Duration, Instant};
-use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
+use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -28,7 +28,7 @@ use crate::transport::TlsTransport;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 use crate::transport::WebsocketTransport;
 
-use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
+use crate::constants::{UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT, run_control_chan_backoff};
 
 // The entrypoint of running a client
 pub async fn run_client(
@@ -205,7 +205,8 @@ async fn do_data_channel_handshake<T: Transport>(
     // Send nonce
     let v: &[u8; HASH_WIDTH_IN_BYTES] = args.session_key[..].try_into().unwrap();
     let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, v.to_owned());
-    conn.write_all(&bincode::serialize(&hello).unwrap()).await?;
+    conn.write_all(&bincode::encode_to_vec(&hello, bincode::config::standard()).unwrap())
+        .await?;
     conn.flush().await?;
 
     Ok(conn)
@@ -227,7 +228,8 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+                .await?;
         }
     }
     Ok(())
@@ -255,16 +257,15 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
-
-    // The channel stores UdpTraffic that needs to be sent to the server
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<UdpTraffic>(UDP_SENDQ_SIZE);
-
-    // FIXME: https://github.com/tokio-rs/tls/issues/40
-    // Maybe this is our concern
     let (mut rd, mut wr) = io::split(conn);
 
     // Keep sending items from the outbound channel to the server
@@ -289,22 +290,9 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
             .await
             .with_context(|| "Failed to read UDPTraffic from the server")?;
         let m = port_map.read().await;
-
         if m.get(&packet.from).is_none() {
-            // This packet is from a address we don't see for a while,
-            // which is not in the UdpPortMap.
-            // So set up a mapping (and a forwarder) for it
-
-            // Drop the reader lock
             drop(m);
-
-            // Grab the writer lock
-            // This is the only thread that will try to grab the writer lock
-            // So no need to worry about some other thread has already set up
-            // the mapping between the gap of dropping the reader lock and
-            // grabbing the writer lock
             let mut m = port_map.write().await;
-
             match udp_connect(local_addr, prefer_ipv6).await {
                 Ok(s) => {
                     let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
@@ -322,8 +310,6 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
                 }
             }
         }
-
-        // Now there should be a udp forwarder that can receive the packet
         let m = port_map.read().await;
         if let Some(tx) = m.get(&packet.from) {
             let _ = tx.send(packet.data).await;
@@ -417,7 +403,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
         debug!("Sending hello");
         let hello_send =
             Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest[..].try_into().unwrap());
-        conn.write_all(&bincode::serialize(&hello_send).unwrap())
+        conn.write_all(&bincode::encode_to_vec(&hello_send, bincode::config::standard()).unwrap())
             .await?;
         conn.flush().await?;
 
@@ -437,7 +423,8 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         let session_key = protocol::digest(&concat);
         let auth = Auth(session_key);
-        conn.write_all(&bincode::serialize(&auth).unwrap()).await?;
+        conn.write_all(&bincode::encode_to_vec(&auth, bincode::config::standard()).unwrap())
+            .await?;
         conn.flush().await?;
 
         // Read ack
