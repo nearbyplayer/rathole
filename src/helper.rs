@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
 use backoff::{backoff::Backoff, Notify};
 use socket2::{SockRef, TcpKeepalive};
-use std::{future::Future, net::SocketAddr, time::Duration};
+use std::{future::Future, net::SocketAddr, net::IpAddr, time::Duration};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{
     net::{lookup_host, TcpStream, ToSocketAddrs, UdpSocket},
@@ -192,4 +192,55 @@ where
         .with_context(|| "Failed to write data")?;
     conn.flush().await.with_context(|| "Failed to flush data")?;
     Ok(())
+}
+
+pub fn generate_proxy_protocol_v1_header(s: &TcpStream) -> Result<String> {
+    let local_addr = s.local_addr()?;
+    let remote_addr = s.peer_addr()?;
+    let proto = if local_addr.is_ipv4() { "TCP4" } else { "TCP6" };
+    let header = format!(
+        "PROXY {} {} {} {} {}\r\n",
+        proto,
+        remote_addr.ip(),
+        local_addr.ip(),
+        remote_addr.port(),
+        local_addr.port()
+    );
+    Ok(header)
+}
+
+pub fn generate_proxy_protocol_v2_header_tcp(s: &TcpStream) -> Result<Vec<u8>> {
+    let local_addr = s.local_addr()?;
+    let remote_addr = s.peer_addr()?;
+    generate_proxy_protocol_v2_header_core(local_addr, remote_addr, true)
+}
+
+pub fn generate_proxy_protocol_v2_header_udp(local_addr: SocketAddr, remote_addr: SocketAddr) -> Result<Vec<u8>> {
+    generate_proxy_protocol_v2_header_core(local_addr, remote_addr, false)
+}
+
+fn generate_proxy_protocol_v2_header_core(local_addr: SocketAddr, remote_addr: SocketAddr, is_tcp: bool) -> Result<Vec<u8>> {
+    let mut header = vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // Signature
+        0x21, // Version 2, Command PROXY
+        0x00, // Family/protocol, set below
+        0x00, 0x0C, // Length (12 bytes for IPv4/IPv6 addresses)
+    ];
+
+    match (remote_addr.ip(), local_addr.ip()) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            header[13] = if is_tcp { 0x11 } else { 0x12 }; // TCP/UDP over IPv4
+            header.extend_from_slice(&src.octets());
+            header.extend_from_slice(&dst.octets());
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            header[13] = if is_tcp { 0x21 } else { 0x22 }; // TCP/UDP over IPv6
+            header.extend_from_slice(&src.octets());
+            header.extend_from_slice(&dst.octets());
+        }
+        _ => return Err(anyhow!("IP version mismatch")),
+    }
+    header.extend_from_slice(&remote_addr.port().to_be_bytes());
+    header.extend_from_slice(&local_addr.port().to_be_bytes());
+    Ok(header)
 }

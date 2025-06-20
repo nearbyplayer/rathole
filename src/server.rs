@@ -1,7 +1,7 @@
-use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
+use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType, ProxyProtocolVersion};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
-use crate::helper::{retry_notify_with_deadline, write_and_flush};
+use crate::helper::{generate_proxy_protocol_v1_header, generate_proxy_protocol_v2_header_tcp, generate_proxy_protocol_v2_header_udp, retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
@@ -427,11 +427,16 @@ where
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
+        let enable_proxy_protocol = service.enable_proxy_protocol.unwrap_or_default();
+        let proxy_protocol_version = service.proxy_protocol_version.unwrap_or_default();
+
         match service.service_type {
             ServiceType::Tcp => tokio::spawn(
                 async move {
                     if let Err(e) = run_tcp_connection_pool::<T>(
                         bind_addr,
+                        enable_proxy_protocol,
+                        proxy_protocol_version,
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -448,6 +453,8 @@ where
                 async move {
                     if let Err(e) = run_udp_connection_pool::<T>(
                         bind_addr,
+                        enable_proxy_protocol,
+                        proxy_protocol_version,
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -625,6 +632,8 @@ fn tcp_listen_and_send(
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
+    enable_proxy_protocol: bool,
+    proxy_protocol_version: ProxyProtocolVersion,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -637,6 +646,21 @@ async fn run_tcp_connection_pool<T: Transport>(
             if let Some(mut ch) = data_ch_rx.recv().await {
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
                     tokio::spawn(async move {
+                        if enable_proxy_protocol {
+                            match proxy_protocol_version {
+                                ProxyProtocolVersion::V1 => {
+                                    let proxy_proto_header = generate_proxy_protocol_v1_header(&visitor).unwrap();
+                                    let _ = ch.write_all(proxy_proto_header.as_bytes()).await;
+                                    let _ = ch.flush().await;
+                                }
+                                ProxyProtocolVersion::V2 => {
+                                    let proxy_proto_header = generate_proxy_protocol_v2_header_tcp(&visitor).unwrap();
+                                    let _ = ch.write_all(&proxy_proto_header).await;
+                                    let _ = ch.flush().await;
+                                }
+                                ProxyProtocolVersion::None => {}
+                            }
+                        }
                         let _ = copy_bidirectional(&mut ch, &mut visitor).await;
                     });
                     break;
@@ -659,11 +683,21 @@ async fn run_tcp_connection_pool<T: Transport>(
 #[instrument(skip_all)]
 async fn run_udp_connection_pool<T: Transport>(
     bind_addr: String,
+    enable_proxy_protocol: bool,
+    proxy_protocol_version: ProxyProtocolVersion,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    // TODO: Load balance
+    // Hash-based UDP load balancing
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+
+    fn hash_addr(addr: &std::net::SocketAddr) -> usize {
+        let mut hasher = DefaultHasher::new();
+        addr.hash(&mut hasher);
+        hasher.finish() as usize
+    }
 
     let l = retry_notify_with_deadline(
         listen_backoff(),
@@ -680,12 +714,17 @@ async fn run_udp_connection_pool<T: Transport>(
 
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
 
-    // Receive one data channel
-    let mut conn = data_ch_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("No available data channels"))?;
-    write_and_flush(&mut conn, &cmd).await?;
+    // Receive multiple data channels
+    let mut conns = Vec::with_capacity(UDP_POOL_SIZE);
+    for _ in 0..UDP_POOL_SIZE {
+        if let Some(mut conn) = data_ch_rx.recv().await {
+            write_and_flush(&mut conn, &cmd).await?;
+            conns.push(conn);
+        }
+    }
+    if conns.is_empty() {
+        return Err(anyhow!("No available data channels"));
+    }
 
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
@@ -693,14 +732,34 @@ async fn run_udp_connection_pool<T: Transport>(
             // Forward inbound traffic to the client
             val = l.recv_from(&mut buf) => {
                 let (n, from) = val?;
-                UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
+                let mut data_to_send: Vec<u8>;
+
+                if enable_proxy_protocol {
+                    let header = match proxy_protocol_version {
+                        ProxyProtocolVersion::V1 => Vec::new(),
+                        ProxyProtocolVersion::V2 => generate_proxy_protocol_v2_header_udp(l.local_addr()?, from)?,
+                        ProxyProtocolVersion::None => Vec::new(),
+                    };
+                    data_to_send = Vec::with_capacity(header.len() + n);
+                    data_to_send.extend_from_slice(&header);
+                    data_to_send.extend_from_slice(&buf[..n]);
+                } else {
+                    data_to_send = buf[..n].to_vec();
+                }
+
+                // Hash-based selection
+                let idx = hash_addr(&from) % conns.len();
+                {
+                    let conn = &mut conns[idx];
+                    UdpTraffic::write_slice(conn, from, &data_to_send).await?;
+                }
             },
 
             // Forward outbound traffic from the client to the visitor
-            hdr_len = conn.read_u8() => {
-                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
+            hdr_len = conns[0].read_u8() => {
+                let t = UdpTraffic::read(&mut conns[0], hdr_len?).await?;
                 l.send_to(&t.data, t.from).await?;
-            }
+            },
 
             _ = shutdown_rx.recv() => {
                 break;

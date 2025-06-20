@@ -92,6 +92,14 @@ fn default_service_type() -> ServiceType {
     Default::default()
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyProtocolVersion {
+    #[default]
+    None,
+    V1,
+    V2
+}
+
 /// Per service config
 /// All Option are optional in configuration but must be Some value in runtime
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -104,6 +112,8 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    pub enable_proxy_protocol: Option<bool>,
+    pub proxy_protocol_version: Option<ProxyProtocolVersion>,
 }
 
 impl ServerServiceConfig {

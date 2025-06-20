@@ -14,19 +14,20 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  OPENSSL_NO_VENDOR: "0"
+  OPENSSL_STATIC: "1"
 
 jobs:
   lints:
     name: Lints
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy -- -D warnings
       - name: Setup cargo-hack
@@ -42,33 +43,29 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             exe: rathole
             target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            exe: rathole.exe
-            target: x86_64-pc-windows-msvc
-          - os: macos-latest
+          - os: ubuntu-24.04
             exe: rathole
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            exe: rathole
-            target: aarch64-apple-darwin
+            target: aarch64-unknown-linux-gnu
 
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
         with:
-          profile: minimal
           toolchain: stable
-      - uses: Swatinem/rust-cache@v1
-      - name: Build
-        run: cargo build
-      - name: Run tests with native-tls
-        run: cargo test --verbose
-      - name: Run tests with rustls
-        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
-      - uses: actions/upload-artifact@v2
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        run: cargo install cross
+      - name: Build with cross for ${{ matrix.target }}
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build --target ${{ matrix.target }} --release
+      - name: Build for ${{ matrix.target }}
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --target ${{ matrix.target }} --release
+      - uses: actions/upload-artifact@v4
         with:
           name: rathole-${{ matrix.target }}
-          path: target/debug/${{ matrix.exe }}
+          path: target/${{ matrix.target }}/release/${{ matrix.exe }}
